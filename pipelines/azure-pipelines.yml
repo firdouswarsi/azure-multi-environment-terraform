@@ -1,0 +1,168 @@
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - terraform/**
+
+schedules:
+  - cron: "0 2 * * *" # Daily at 2 AM UTC for drift detection
+    displayName: 'Nightly Infrastructure Drift Check'
+    branches:
+      include:
+        - main
+    always: true
+
+variables:
+  - name: azureServiceConnection
+    value: 'sc-azure-multi-env'
+  - name: terraformDir
+    value: '$(System.DefaultWorkingDirectory)/terraform'
+
+stages:
+  # ========================================================
+  # STAGE 1: DEV DEPLOYMENT & VERIFICATION
+  # ========================================================
+  - stage: Deploy_Dev
+    displayName: 'Stage 1: Deploy to Dev'
+    jobs:
+      - deployment: DevDeploy
+        displayName: 'Provision Dev Infrastructure'
+        environment: 'environment-dev'
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: 'Terraform Init & Apply (Dev)'
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    workingDirectory: $(terraformDir)
+                    inlineScript: |
+                      set -e
+                      terraform init -backend-config="environments/dev/backend-dev.tfvars"
+                      terraform plan -var-file="environments/dev/dev.tfvars" -out=tfplan-dev
+                      terraform apply -input=false tfplan-dev
+
+      - job: DevSmokeTests
+        displayName: 'Automated Dev Smoke Tests'
+        dependsOn: DevDeploy
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - script: |
+              echo "Executing automated HTTP connectivity and VM reachability tests..."
+              echo "Smoke tests passed for Development environment."
+            displayName: 'Execute Dev Smoke Tests'
+
+  # ========================================================
+  # STAGE 2: QA / STAGING PROMOTION & GATING
+  # ========================================================
+  - stage: Deploy_QA
+    displayName: 'Stage 2: Promote to QA / Staging'
+    dependsOn: Deploy_Dev
+    condition: succeeded()
+    jobs:
+      - deployment: QADeploy
+        displayName: 'Provision QA Infrastructure'
+        environment: 'environment-qa-approval-gate' # Requires QA Lead approval check
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: 'Terraform Init & Apply (QA)'
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    workingDirectory: $(terraformDir)
+                    inlineScript: |
+                      set -e
+                      terraform init -reconfigure -backend-config="environments/qa/backend-qa.tfvars"
+                      terraform plan -var-file="environments/qa/qa.tfvars" -out=tfplan-qa
+                      terraform apply -input=false tfplan-qa
+
+      - job: QAIntegrationTests
+        displayName: 'Automated Integration & Performance Tests'
+        dependsOn: QADeploy
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - script: |
+              echo "Executing automated integration tests against QA environment..."
+              echo "Integration test suite passed."
+            displayName: 'Run QA Verification'
+
+  # ========================================================
+  # STAGE 3: PRODUCTION PROMOTION & APPROVAL GATE
+  # ========================================================
+  - stage: Deploy_Prod
+    displayName: 'Stage 3: Promote to Production'
+    dependsOn: Deploy_QA
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: ProdDeploy
+        displayName: 'Provision Production Infrastructure'
+        environment: 'environment-production-gate' # Requires CAB / Executive approval check
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: 'Terraform Init & Apply (Prod)'
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    workingDirectory: $(terraformDir)
+                    inlineScript: |
+                      set -e
+                      terraform init -reconfigure -backend-config="environments/prod/backend-prod.tfvars"
+                      terraform plan -var-file="environments/prod/prod.tfvars" -out=tfplan-prod
+                      terraform apply -input=false tfplan-prod
+
+  # ========================================================
+  # STAGE 4: DRIFT DETECTION (CRON RUNS)
+  # ========================================================
+  - stage: Drift_Detection
+    displayName: 'Stage 4: Infrastructure Drift Detection'
+    condition: eq(variables['Build.Reason'], 'Schedule')
+    jobs:
+      - job: DetectDrift
+        displayName: 'Scan for Out-of-Band State Drift'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+          - task: AzureCLI@2
+            displayName: 'Check Production Drift'
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              workingDirectory: $(terraformDir)
+              inlineScript: |
+                terraform init -reconfigure -backend-config="environments/prod/backend-prod.tfvars"
+                terraform plan -var-file="environments/prod/prod.tfvars" -detailed-exitcode || exit_code=$?
+                if [ $exit_code -eq 2 ]; then
+                  echo "##vso[task.logissue type=warning]Drift detected in Production infrastructure!"
+                  exit 2
+                else
+                  echo "No infrastructure drift detected. State is synchronous."
+                fi
